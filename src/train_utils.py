@@ -123,6 +123,13 @@ def _build_cond(enc_bank, pep_encoder, batch, chains, cond_on):
     enc = {c: enc_bank[c](batch[c]) for c in ("va", "vb")}
     return torch.cat([enc["va"], enc["vb"], p], dim=1)   # "vpep"
 
+@torch.no_grad()
+def _latent_health_cond(cpose, x, cond):
+    """Posterior-collapse check for the conditional VAE on a fixed (x, cond) batch."""
+    cpose.eval(); _, mu, lv, _ = cpose(x, cond)
+    kl_dim = 0.5*(mu.pow(2)+lv.exp()-1-lv).mean(0)
+    return int((kl_dim > 0.01).sum().item()), float(kl_dim.mean().item())
+
 def pretrain_cond_posevae(pool, trans_scale, rotation_encoder, cond_on="vpep",
                           warm_encoders=None, emb_dim=EMB_DIM, chains=CHAINS,
                           epochs=40, bs=256, lr=1e-3, mask_p=0.3, beta=0.1, seed=42,
@@ -164,6 +171,11 @@ def pretrain_cond_posevae(pool, trans_scale, rotation_encoder, cond_on="vpep",
 
     frame = (pool[pool["pose_mask"] == 1] if posed_only else pool).reset_index(drop=True)
     loader = DataLoader(PairData(frame, trans_scale), batch_size=bs, shuffle=True)
+    # fixed batch for the per-epoch latent-health (posterior-collapse) check
+    evb, _ = next(iter(DataLoader(PairData(frame, trans_scale),
+                                  batch_size=min(1024, len(frame)), shuffle=False)))
+    evb = {k: v.to(DEVICE) for k, v in evb.items()}
+    x_eval = evb["pose"]; cond_eval = _build_cond(enc_bank, pep_encoder, evb, chains, cond_on)
 
     hist = []; best = float("inf"); wait = 0; best_state = None; best_ep = 0
     for ep in range(1, epochs+1):
@@ -188,11 +200,13 @@ def pretrain_cond_posevae(pool, trans_scale, rotation_encoder, cond_on="vpep",
             agg["loss"] += loss.item()*nb; agg["recon"] += float(rec)*nb; agg["kld"] += float(kld)*nb
             for k in ("reach_rmse", "dir_deg", "rot_deg"): agg[k] += met[k]*nb
         row = {k: agg[k]/ntot for k in agg}; row["epoch"] = ep
+        row["active_units"], row["kl_per_dim"] = _latent_health_cond(cpose, x_eval, cond_eval)
         hist.append(row)
         if log and (ep % 5 == 0 or ep == 1):
             print(f"  [cpose/{cond_on}] ep{ep:3d} loss={row['loss']:.3f} recon={row['recon']:.3f} "
                   f"KL={row['kld']:.3f} | rot={row['rot_deg']:.1f}deg dir={row['dir_deg']:.1f}deg "
-                  f"reach_rmse={row['reach_rmse']:.3f}")
+                  f"reach_rmse={row['reach_rmse']:.3f} | active={row['active_units']}/{cpose.latent_dim} "
+                  f"kldim={row['kl_per_dim']:.3f}")
         cur = row[monitor]
         if cur < best - min_delta:
             best = cur; wait = 0; best_ep = ep
