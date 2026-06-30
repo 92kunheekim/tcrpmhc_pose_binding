@@ -105,7 +105,7 @@ class PeptideEncoderTransformer(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(emb_dim)); nn.init.normal_(self.mask_token, std=0.02)
         self.film = nn.Linear(emb_dim, 2*emb_dim); nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)
         layer = nn.TransformerEncoderLayer(emb_dim, n_heads, ff, dropout, batch_first=True)
-        self.encoder = nn.TransformerEncoder(layer, n_layers)
+        self.encoder = nn.TransformerEncoder(layer, n_layers, enable_nested_tensor=False)
         self.out_proj = nn.Linear(emb_dim, emb_dim)
     def _encode(self, pep, mhc_emb, mask=None):
         pad = (pep.abs().sum(-1) == 0)                            # (B,L) True = padding
@@ -324,7 +324,7 @@ def pretrain_peptide_masked(pep_seqs, mhc_esm, max_len=PEP_MAXLEN, mask_p=0.15,
             with torch.no_grad():
                 pred = logits.argmax(-1)
                 corr += int((pred[mask] == ti[mask]).sum()); msk += int(mask.sum())
-            tot += float(loss) * xb.size(0); n_tot += xb.size(0)
+            tot += loss.item() * xb.size(0); n_tot += xb.size(0)
         ep_loss = tot/max(n_tot, 1); ep_acc = corr/max(msk, 1)
         hist.append(dict(epoch=ep, loss=ep_loss, masked_acc=ep_acc))
         if log: print(f"[pep-mask:{arch}] ep {ep:3d}  loss {ep_loss:.4f}  masked_acc {ep_acc:.3f}")
@@ -446,7 +446,7 @@ def pretrain_cond_pose_vae(model, loader, epochs=40, lr=1e-3, beta=0.1, log=True
             _, recon, mu, lv = model(b, return_aux=True)
             loss = cvae_loss_masked(recon, b["pose"], mu, lv, b["pose_mask"], beta)
             opt.zero_grad(); loss.backward(); opt.step()
-            bs = b["pose"].size(0); tot += float(loss)*bs; n += bs
+            bs = b["pose"].size(0); tot += loss.item()*bs; n += bs
         ep_loss = tot/max(n, 1); hist.append(dict(epoch=ep, loss=ep_loss))
         if log: print(f"[cpose-pretrain] ep {ep:3d}  recon+beta*KL {ep_loss:.4f}")
         if ep_loss < best - min_delta:
@@ -617,7 +617,7 @@ def pretrain_cond_pose_vae_cached(model, cache, epochs=40, lr=1e-3, beta=0.1, bs
             recon, mu, lv, _ = model.cpose(v["pose"], cond)
             loss = cvae_loss_masked(recon, v["pose"], mu, lv, v["pose_mask"], beta)
             opt.zero_grad(); loss.backward(); opt.step()
-            b_ = v["pose"].size(0); tot += float(loss)*b_; n += b_
+            b_ = v["pose"].size(0); tot += loss.item()*b_; n += b_
         ep_loss = tot/max(n, 1); hist.append(dict(epoch=ep, loss=ep_loss))
         if log: print(f"[cpose-pretrain-cached] ep {ep:3d}  recon+beta*KL {ep_loss:.4f}")
         if ep_loss < best - min_delta:
