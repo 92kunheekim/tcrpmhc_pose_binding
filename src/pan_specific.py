@@ -89,6 +89,41 @@ class MHCConditionedPeptideEncoder(nn.Module):
         return (1.0 + gamma)*z + beta
 
 
+class PeptideEncoderTransformer(nn.Module):
+    """Per-position peptide transformer (stronger than the pooled ChainEncoder for masked
+    modelling). Residue Atchley -> linear + learned position embedding, masked positions
+    replaced by a learned [MASK] token, FiLM-conditioned on the MHC embedding (per position),
+    then a small TransformerEncoder over positions.
+      forward(...) -> pooled emb (mean over real residues -> Linear): drop-in peptide tower.
+      forward(..., return_tokens=True) -> per-position states (B,L,emb): for the MLM head.
+    Padding (all-zero Atchley rows) is masked from attention; the FiLM layer is zero-init
+    so it starts as a plain (MHC-agnostic) transformer."""
+    def __init__(self, emb_dim=EMB_DIM, n_layers=2, n_heads=4, ff=128, max_len=PEP_MAXLEN, dropout=0.1):
+        super().__init__(); self.d = emb_dim; self.max_len = max_len
+        self.res_proj = nn.Linear(5, emb_dim)
+        self.pos_emb = nn.Parameter(torch.zeros(max_len, emb_dim)); nn.init.normal_(self.pos_emb, std=0.02)
+        self.mask_token = nn.Parameter(torch.zeros(emb_dim)); nn.init.normal_(self.mask_token, std=0.02)
+        self.film = nn.Linear(emb_dim, 2*emb_dim); nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)
+        layer = nn.TransformerEncoderLayer(emb_dim, n_heads, ff, dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(layer, n_layers)
+        self.out_proj = nn.Linear(emb_dim, emb_dim)
+    def _encode(self, pep, mhc_emb, mask=None):
+        pad = (pep.abs().sum(-1) == 0)                            # (B,L) True = padding
+        x = self.res_proj(pep) + self.pos_emb[:pep.size(1)].unsqueeze(0)
+        if mask is not None:
+            x = torch.where(mask.unsqueeze(-1), self.mask_token.view(1, 1, -1), x)
+        g, b = self.film(mhc_emb).chunk(2, dim=-1)                # per-position FiLM (broadcast)
+        x = (1.0 + g).unsqueeze(1)*x + b.unsqueeze(1)
+        return self.encoder(x, src_key_padding_mask=pad), pad
+    def forward(self, pep_atchley, mhc_emb, mask=None, return_tokens=False):
+        tok, pad = self._encode(pep_atchley, mhc_emb, mask)
+        if return_tokens:
+            return tok
+        keep = (~pad).float().unsqueeze(-1)
+        pooled = (tok*keep).sum(1) / keep.sum(1).clamp_min(1.0)   # mean over real residues
+        return self.out_proj(pooled)
+
+
 # Head feature blocks (each emb_dim, except `pose` = cpose.latent_dim):
 #   t   = TCR embedding         p = peptide (MHC-conditioned)   h = MHC
 #   tp  = t * p (TCR x peptide) th = t * h (TCR x MHC)          pose = conditioned pose_mu
@@ -117,11 +152,13 @@ class PanFusion(nn.Module):
 
     def __init__(self, emb_dim=EMB_DIM, hidden_head=128, dropout=0.3, chains=CHAINS,
                  use_pose=True, rotation_encoder="6d", esm_dim=ESM_DIM,
-                 head_feats="full"):
+                 head_feats="full", pep_arch="transformer"):
         super().__init__(); self.chains = chains; self.use_pose = use_pose
         self.encoders = nn.ModuleDict({c: ChainEncoder(emb_dim=emb_dim) for c in chains})
         self.mhc_encoder = MHCEncoder(emb_dim=emb_dim, esm_dim=esm_dim)   # projects precomputed ESM-2 vec
-        self.pep_encoder = MHCConditionedPeptideEncoder(emb_dim=emb_dim)  # peptide conditioned on MHC
+        # peptide tower (MHC-conditioned). 'transformer' = per-position MLM-pretrainable; 'conv' = pooled ChainEncoder
+        self.pep_encoder = (PeptideEncoderTransformer(emb_dim=emb_dim) if pep_arch == "transformer"
+                            else MHCConditionedPeptideEncoder(emb_dim=emb_dim))
         self.tcr_proj = nn.Linear(emb_dim*len(chains), emb_dim)
         pose_dim = 0
         if use_pose:
@@ -194,10 +231,29 @@ class MHCMaskedPeptideModel(nn.Module):
         self.pep_encoder = MHCConditionedPeptideEncoder(emb_dim=emb_dim)   # .pep + .film
         self.decoder = nn.Linear(emb_dim, max_len*n_aa)                    # per-position AA logits
 
-    def forward(self, masked_pep, mhc_esm):
+    def forward(self, masked_pep, mhc_esm, mask=None):
         h = self.mhc_encoder(mhc_esm)                  # (B, emb)
         z = self.pep_encoder(masked_pep, h)            # MHC-conditioned peptide emb (B, emb)
         return self.decoder(z).view(-1, self.max_len, self.n_aa)   # (B, L, 20)
+
+
+class MHCMaskedPeptideTransformer(nn.Module):
+    """Stronger MLM: per-position TransformerEncoder (no pooling bottleneck) over the
+    peptide, FiLM-conditioned on the MHC. Predicts each masked residue from its *context*
+    + allele -> learns anchor motifs far better than the pooled model. Its `pep_encoder`
+    (a PeptideEncoderTransformer) and `mhc_encoder` warm-start PanFusion (pep_arch='transformer')."""
+    def __init__(self, emb_dim=EMB_DIM, esm_dim=ESM_DIM, max_len=PEP_MAXLEN, n_aa=len(AA_ORDER),
+                 n_layers=2, n_heads=4, ff=128, dropout=0.1):
+        super().__init__(); self.max_len = max_len; self.n_aa = n_aa
+        self.mhc_encoder = MHCEncoder(emb_dim=emb_dim, esm_dim=esm_dim)
+        self.pep_encoder = PeptideEncoderTransformer(emb_dim=emb_dim, n_layers=n_layers,
+                                                     n_heads=n_heads, ff=ff, max_len=max_len, dropout=dropout)
+        self.head = nn.Linear(emb_dim, n_aa)            # per-position AA logits
+
+    def forward(self, pep, mhc_esm, mask=None):
+        h = self.mhc_encoder(mhc_esm)
+        tok = self.pep_encoder(pep, h, mask=mask, return_tokens=True)   # (B, L, emb)
+        return self.head(tok)                                            # (B, L, 20)
 
 
 def peptide_pretrain_arrays(df, esm_table, pep_col="peptide", mhc_col="mhc_seq"):
@@ -212,21 +268,23 @@ def peptide_pretrain_arrays(df, esm_table, pep_col="peptide", mhc_col="mhc_seq")
 
 def pretrain_peptide_masked(pep_seqs, mhc_esm, max_len=PEP_MAXLEN, mask_p=0.15,
                             epochs=40, bs=256, lr=1e-3, seed=42, device=None,
-                            log=True, return_history=False,
-                            early_stop=True, patience=8, min_delta=1e-4):
+                            log=True, return_history=False, return_model=False,
+                            early_stop=True, patience=8, min_delta=1e-4, arch="transformer"):
     """Self-supervised MHC-conditioned masked-residue pretraining of the peptide tower.
 
     pep_seqs : list[str] of presented peptides.
     mhc_esm  : (N, esm_dim) precomputed ESM-2 vectors of the presenting allele, aligned
                row-for-row with pep_seqs (use peptide_pretrain_arrays to build both).
+    arch     : 'transformer' (per-position TransformerEncoder; stronger MLM, recommended)
+               or 'pooled' (legacy ChainEncoder bottleneck).
 
-    Dynamic BERT-style masking each step (mask_p of non-pad residues -> Atchley row zeroed),
-    cross-entropy on the masked positions only. Tracks masked-residue top-1 accuracy
-    (anchors should be predicted well once the allele motif is learned) and plateau
-    early-stops on training loss with best-weight restore.
+    Dynamic BERT-style masking each step (mask_p of non-pad residues); cross-entropy on the
+    masked positions only. Tracks masked-residue top-1 accuracy and plateau early-stops on
+    training loss with best-weight restore.
 
-    Returns (pep_state, mhc_state[, history_df]) -- state dicts to warm-start
-    `model.pep_encoder` and `model.mhc_encoder` of PanFusion (via make_warm_start)."""
+    Returns (pep_state, mhc_state[, history_df][, model]) -- state dicts warm-start
+    `model.pep_encoder`/`model.mhc_encoder` of PanFusion (pep_arch must match `arch`).
+    Pass return_model=True to also get the trained MLM (e.g. for masked_accuracy_breakdown)."""
     import pandas as pd
     device = device or DEVICE
     torch.manual_seed(seed); np.random.seed(seed)
@@ -241,22 +299,26 @@ def pretrain_peptide_masked(pep_seqs, mhc_esm, max_len=PEP_MAXLEN, mask_p=0.15,
     ds = TensorDataset(torch.tensor(X), torch.tensor(TI), torch.tensor(M))
     loader = DataLoader(ds, batch_size=bs, shuffle=True)
 
-    model = MHCMaskedPeptideModel(esm_dim=M.shape[1], max_len=max_len).to(device)
+    is_tf = arch == "transformer"
+    model = (MHCMaskedPeptideTransformer if is_tf else MHCMaskedPeptideModel)(
+        esm_dim=M.shape[1], max_len=max_len).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     crit = nn.CrossEntropyLoss(ignore_index=-100)
 
     hist, best, wait, best_state, best_ep = [], float("inf"), 0, None, 0
     for ep in range(1, epochs+1):
-        model.train(); tot = cnt = corr = msk = n_tot = 0
+        model.train(); tot = corr = msk = n_tot = 0
         for xb, ti, mb in loader:
             xb, ti, mb = xb.to(device), ti.to(device), mb.to(device)
             nonpad = ti != -100
             mask = nonpad & (torch.rand(ti.shape, device=device) < mask_p)
             if not bool(mask.any()):                         # guarantee >=1 masked token
                 idx = nonpad.float().argmax(1); mask[torch.arange(ti.size(0)), idx] = nonpad.any(1)
-            xin = xb.clone(); xin[mask] = 0.0                # blank the masked residues
+            if is_tf:                                        # transformer: pass mask -> [MASK] token
+                logits = model(xb, mb, mask=mask)
+            else:                                            # pooled: blank masked Atchley rows
+                xin = xb.clone(); xin[mask] = 0.0; logits = model(xin, mb)
             target = torch.where(mask, ti, torch.full_like(ti, -100))
-            logits = model(xin, mb)
             loss = crit(logits.reshape(-1, model.n_aa), target.reshape(-1))
             opt.zero_grad(); loss.backward(); opt.step()
             with torch.no_grad():
@@ -265,7 +327,7 @@ def pretrain_peptide_masked(pep_seqs, mhc_esm, max_len=PEP_MAXLEN, mask_p=0.15,
             tot += float(loss) * xb.size(0); n_tot += xb.size(0)
         ep_loss = tot/max(n_tot, 1); ep_acc = corr/max(msk, 1)
         hist.append(dict(epoch=ep, loss=ep_loss, masked_acc=ep_acc))
-        if log: print(f"[pep-mask] ep {ep:3d}  loss {ep_loss:.4f}  masked_acc {ep_acc:.3f}")
+        if log: print(f"[pep-mask:{arch}] ep {ep:3d}  loss {ep_loss:.4f}  masked_acc {ep_acc:.3f}")
         if ep_loss < best - min_delta:
             best, wait, best_ep = ep_loss, 0, ep
             best_state = {"pep": {k: v.detach().cpu().clone() for k, v in model.pep_encoder.state_dict().items()},
@@ -273,12 +335,62 @@ def pretrain_peptide_masked(pep_seqs, mhc_esm, max_len=PEP_MAXLEN, mask_p=0.15,
         else:
             wait += 1
             if early_stop and wait >= patience:
-                if log: print(f"[pep-mask] early stop at ep {ep} (best ep {best_ep}, loss {best:.4f})")
+                if log: print(f"[pep-mask:{arch}] early stop at ep {ep} (best ep {best_ep}, loss {best:.4f})")
                 break
     if best_state is None:   # epochs==0 guard
         best_state = {"pep": model.pep_encoder.state_dict(), "mhc": model.mhc_encoder.state_dict()}
-    out = (best_state["pep"], best_state["mhc"])
-    return (*out, pd.DataFrame(hist)) if return_history else out
+    model.pep_encoder.load_state_dict(best_state["pep"]); model.mhc_encoder.load_state_dict(best_state["mhc"])
+    out = [best_state["pep"], best_state["mhc"]]
+    if return_history: out.append(pd.DataFrame(hist))
+    if return_model: out.append(model)
+    return tuple(out) if (return_history or return_model) else (out[0], out[1])
+
+
+@torch.no_grad()
+def masked_accuracy_breakdown(model, pep_seqs, mhc_esm, alleles=None, device=None,
+                              bs=512, max_len=PEP_MAXLEN):
+    """Per-position and per-allele masked-residue top-1 accuracy. For each position, mask
+    exactly that position (where a residue is present) and predict it from context + MHC.
+    A working MLM shows accuracy *spikes at the anchor positions* (P2, P-Omega) well above the
+    variable middle positions, even if the overall average is modest.
+
+    model   : a trained MLM (MHCMaskedPeptideTransformer / MHCMaskedPeptideModel).
+    alleles : optional array aligned with pep_seqs for the per-allele breakdown.
+    Returns (per_position_df, per_allele_df_or_None)."""
+    import pandas as pd
+    from collections import defaultdict
+    device = device or DEVICE; model.to(device).eval()
+    N = len(pep_seqs)
+    X = np.stack([encode_sequence(s, max_len) for s in pep_seqs]).astype("float32")
+    TI = np.full((N, max_len), -100, dtype=np.int64)
+    for n, s in enumerate(pep_seqs):
+        for j, a in enumerate(str(s).strip().upper()[:max_len]):
+            if a in _AA2I: TI[n, j] = _AA2I[a]
+    Xt, TIt, Mt = torch.tensor(X), torch.tensor(TI), torch.tensor(np.asarray(mhc_esm, "float32"))
+    al = np.asarray(alleles) if alleles is not None else None
+    pos_corr = np.zeros(max_len); pos_tot = np.zeros(max_len)
+    al_corr, al_tot = defaultdict(int), defaultdict(int)
+    for pos in range(max_len):
+        if int((TIt[:, pos] != -100).sum()) == 0: continue
+        for i in range(0, N, bs):
+            xb = Xt[i:i+bs].to(device); ti = TIt[i:i+bs].to(device); mb = Mt[i:i+bs].to(device)
+            v = ti[:, pos] != -100
+            if not bool(v.any()): continue
+            mask = torch.zeros(xb.shape[:2], dtype=torch.bool, device=device); mask[:, pos] = v
+            pred = model(xb, mb, mask=mask)[:, pos].argmax(-1)
+            ok = (pred == ti[:, pos]) & v
+            pos_corr[pos] += int(ok.sum()); pos_tot[pos] += int(v.sum())
+            if al is not None:
+                for a, isv, hit in zip(al[i:i+bs], v.cpu().numpy(), ok.cpu().numpy()):
+                    if isv: al_tot[a] += 1; al_corr[a] += int(hit)
+    per_pos = pd.DataFrame({"position": np.arange(max_len)+1,
+                            "acc": pos_corr/np.clip(pos_tot, 1, None), "n": pos_tot.astype(int)})
+    per_pos = per_pos[per_pos.n > 0].reset_index(drop=True)
+    per_al = None
+    if al is not None:
+        per_al = (pd.DataFrame([{"allele": a, "acc": al_corr[a]/al_tot[a], "n": al_tot[a]} for a in al_tot])
+                  .sort_values("n", ascending=False).reset_index(drop=True))
+    return per_pos, per_al
 
 
 # ----------------------------------------------------------------------------
