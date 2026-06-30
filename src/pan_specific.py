@@ -152,7 +152,7 @@ class PanFusion(nn.Module):
 
     def __init__(self, emb_dim=EMB_DIM, hidden_head=128, dropout=0.3, chains=CHAINS,
                  use_pose=True, rotation_encoder="6d", esm_dim=ESM_DIM,
-                 head_feats="full", pep_arch="transformer"):
+                 head_feats="full", pep_arch="transformer", latent_per_body=4):
         super().__init__(); self.chains = chains; self.use_pose = use_pose
         self.encoders = nn.ModuleDict({c: ChainEncoder(emb_dim=emb_dim) for c in chains})
         self.mhc_encoder = MHCEncoder(emb_dim=emb_dim, esm_dim=esm_dim)   # projects precomputed ESM-2 vec
@@ -162,7 +162,9 @@ class PanFusion(nn.Module):
         self.tcr_proj = nn.Linear(emb_dim*len(chains), emb_dim)
         pose_dim = 0
         if use_pose:
-            self.cpose = ConditionalPoseVAERaw(cond_dim=4*emb_dim, rotation_encoder=rotation_encoder)  # [Va,Vb,pep,mhc]
+            # latent_per_body>=6 matches the per-body intrinsic DOF (reach1+dir2+rot3); 4 is under-complete
+            self.cpose = ConditionalPoseVAERaw(cond_dim=4*emb_dim, latent_per_body=latent_per_body,
+                                               rotation_encoder=rotation_encoder)  # cond=[Va,Vb,pep,mhc]
             pose_dim = self.cpose.latent_dim; self.null_pose = nn.Parameter(torch.zeros(pose_dim))
         # resolve head feature selection
         feats = HEAD_PRESETS[head_feats] if isinstance(head_feats, str) else tuple(head_feats)
@@ -659,8 +661,8 @@ def predict_cached(model, cache, bs=1024):
 
 def run_cpose_ablation(frame, trans_scale, esm_table, splits, warm,
                        head_feats="pose_tp", pep_arch="transformer", rotation_encoder="6d",
-                       epochs=15, pre_epochs=30, lr=1e-3, lam_pose=0.3, beta=0.1, bs=512,
-                       mhc_col="mhc_seq", conditions=("A", "B", "C", "D"), log=True):
+                       latent_per_body=4, epochs=15, pre_epochs=30, lr=1e-3, lam_pose=0.3,
+                       beta=0.1, bs=512, mhc_col="mhc_seq", conditions=("A", "B", "C", "D"), log=True):
     """Conditional-pose-VAE pretraining ablation (A/B/C/D) on a fixed-antigen / single-allele
     set, using cached frozen towers (towers warm-started once per split; only the pose tower
     + head differ across conditions).
@@ -681,7 +683,7 @@ def run_cpose_ablation(frame, trans_scale, esm_table, splits, warm,
 
     def fresh():
         return warm(PanFusion(use_pose=True, pep_arch=pep_arch, rotation_encoder=rotation_encoder,
-                              head_feats=head_feats))
+                              head_feats=head_feats, latent_per_body=latent_per_body))
 
     rows = []; oof = {c: {"idx": [], "y": [], "p": []} for c in conditions}
     for si, (tr, te) in enumerate(splits):
