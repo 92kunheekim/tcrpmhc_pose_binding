@@ -11,9 +11,12 @@ from encoders import ChainAutoencoder
 from pose_vae import PoseVAERaw, vae_raw_loss
 from pose_cvae import cvae_loss_masked
 from data import PairData, add_mismatch
+from geometry import quat_to_matrix, canonicalize_quat, geodesic_angle
 import torch.nn.functional as F
+import math, pandas as pd
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RAD2DEG = 180.0/math.pi
 
 # ---- pretraining ----
 def pretrain_tcr_encoders(seq_df, epochs=12, bs=256, lr=1e-3, seed=42):
@@ -36,17 +39,71 @@ def make_warm_start(tcr_enc):
         return model
     return warm_start
 
-def pretrain_posevae(pose_mat, rotation_encoder, epochs=25, bs=256, lr=1e-3, mask_p=0.3, seed=42, n_bodies=7):
+def _pose_components(recon, x, mu, logvar):
+    """Returns (rec_loss, kld, metrics) — rec matches vae_raw_loss; metrics in
+    interpretable units: reach RMSE (scaled), direction & rotation error in degrees."""
+    rec = x.new_zeros(()); reach_se = []; dir_d = []; rot_d = []
+    for i, (rh, dh, Rh) in enumerate(recon):
+        seg = x[:, i*7:(i+1)*7]; t, q = seg[:, 0:3], seg[:, 3:7]
+        reach = torch.linalg.norm(t, dim=-1, keepdim=True); d = t/reach.clamp_min(1e-8); R = quat_to_matrix(canonicalize_quat(q))
+        l_reach = F.mse_loss(rh, reach); cos = (dh*d).sum(-1).clamp(-1, 1); ga = geodesic_angle(Rh, R)
+        rec = rec + l_reach + (1-cos).mean() + ga.mean()
+        reach_se.append(l_reach.detach()); dir_d.append(torch.arccos(cos.clamp(-1+1e-6, 1-1e-6)).mean().detach()*RAD2DEG); rot_d.append(ga.mean().detach()*RAD2DEG)
+    kld = -0.5*torch.mean(1+logvar-mu.pow(2)-logvar.exp())
+    m = {"reach_rmse": float(torch.stack(reach_se).mean().sqrt()),
+         "dir_deg": float(torch.stack(dir_d).mean()), "rot_deg": float(torch.stack(rot_d).mean())}
+    return rec, kld, m
+
+@torch.no_grad()
+def _latent_health(vae, X, bs=1024):
+    """Posterior-collapse check: per-dim KL and #active latent dims (KL>0.01)."""
+    vae.eval(); x = torch.tensor(X[:bs], dtype=torch.float32).to(DEVICE); _, mu, lv, _ = vae(x)
+    kl_dim = 0.5*(mu.pow(2)+lv.exp()-1-lv).mean(0)
+    return int((kl_dim > 0.01).sum().item()), float(kl_dim.mean().item())
+
+def pretrain_posevae(pose_mat, rotation_encoder, epochs=40, bs=256, lr=1e-3, mask_p=0.3,
+                     beta=0.1, seed=42, n_bodies=7, return_history=False, log=True,
+                     early_stop=True, patience=8, min_delta=1e-3, monitor="recon"):
+    """Masked-body pose VAE pretraining with plateau early stopping.
+    Stops when `monitor` (default reconstruction loss) fails to improve by > min_delta
+    for `patience` consecutive epochs; restores the best-epoch weights.
+    With return_history=True, also returns a per-epoch DataFrame."""
     torch.manual_seed(seed); vae = PoseVAERaw(rotation_encoder=rotation_encoder).to(DEVICE)
     opt = torch.optim.Adam(vae.parameters(), lr=lr)
-    loader = DataLoader(TensorDataset(torch.tensor(pose_mat)), batch_size=bs, shuffle=True); vae.train()
-    for _ in range(epochs):
+    loader = DataLoader(TensorDataset(torch.tensor(pose_mat)), batch_size=bs, shuffle=True)
+    hist = []; best = float("inf"); wait = 0; best_state = None; best_ep = 0
+    for ep in range(1, epochs+1):
+        vae.train(); agg = defaultdict(float); ntot = 0
         for (x,) in loader:
             x = x.to(DEVICE); xin = x.clone()
             for bi in range(n_bodies):
                 mm = torch.rand(x.size(0), device=DEVICE) < mask_p; xin[mm, bi*7:(bi+1)*7] = 0.0
-            recon, mu, lv, _ = vae(xin); loss = vae_raw_loss(recon, x, mu, lv); opt.zero_grad(); loss.backward(); opt.step()
-    vae.eval(); return vae
+            recon, mu, lv, _ = vae(xin); rec, kld, m = _pose_components(recon, x, mu, lv)
+            loss = rec + beta*kld; opt.zero_grad(); loss.backward(); opt.step()
+            nb = x.size(0); ntot += nb
+            agg["loss"] += loss.item()*nb; agg["recon"] += rec.item()*nb; agg["kld"] += kld.item()*nb
+            for k in ("reach_rmse", "dir_deg", "rot_deg"): agg[k] += m[k]*nb
+        row = {k: agg[k]/ntot for k in agg}; row["epoch"] = ep
+        row["active_units"], row["kl_per_dim"] = _latent_health(vae, pose_mat)
+        hist.append(row)
+        if log and (ep % 5 == 0 or ep == 1):
+            print(f"  ep{ep:3d} loss={row['loss']:.3f} recon={row['recon']:.3f} KL={row['kld']:.3f} | "
+                  f"rot={row['rot_deg']:.1f}deg dir={row['dir_deg']:.1f}deg reach_rmse={row['reach_rmse']:.3f} | "
+                  f"active={row['active_units']}/{vae.latent_dim} kldim={row['kl_per_dim']:.3f}")
+        # plateau early stopping on the monitored training loss
+        cur = row[monitor]
+        if cur < best - min_delta:
+            best = cur; wait = 0; best_ep = ep
+            best_state = {k: v.detach().cpu().clone() for k, v in vae.state_dict().items()}
+        elif early_stop:
+            wait += 1
+            if wait >= patience:
+                if log: print(f"  early stop at epoch {ep} (no {monitor} improvement >{min_delta} for {patience} epochs; best epoch {best_ep})")
+                break
+    if best_state is not None:
+        vae.load_state_dict(best_state)
+    vae.eval()
+    return (vae, pd.DataFrame(hist)) if return_history else vae
 
 # ---- supervised training ----
 def predict(model, loader):
