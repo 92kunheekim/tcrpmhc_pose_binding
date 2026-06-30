@@ -25,10 +25,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, TensorDataset, DataLoader
-from config import CHAINS, CHAIN_MAXLEN, PEP_MAXLEN, EMB_DIM
+from config import CHAINS, CHAIN_MAXLEN, PEP_MAXLEN, EMB_DIM, BODIES
 from atchley import encode_sequence, ATCHLEY
 from encoders import ChainEncoder
 from pose_cvae import ConditionalPoseVAERaw, cvae_loss_masked
+from geometry import rot6d_to_matrix, quat_to_matrix, canonicalize_quat, geodesic_angle
 from data import build_pose
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -716,3 +717,120 @@ def run_cpose_ablation(frame, trans_scale, esm_table, splits, warm,
     for c in conditions:
         oof[c] = {k: np.concatenate(v) for k, v in oof[c].items()}
     return pd.DataFrame(rows), oof
+
+
+# ----------------------------------------------------------------------------
+# Residualized pose (Phase 1-2 of the residualized-contrastive plan):
+# regress pose from cond=[Va,Vb,pep,MHC], keep the sequence-UNEXPLAINED residual
+# (translation residual in R^3 + relative-rotation so(3) log), then verify the
+# residual is ~orthogonal to cond. Fit the regressor on TRAIN folds only.
+# ----------------------------------------------------------------------------
+def _cond_from_cache(cache):
+    """cond = [Va, Vb, peptide, MHC] from cached frozen-tower features -> (N, 4*emb)."""
+    return torch.cat([cache["va"], cache["vb"], cache["p"], cache["h"]], 1)
+
+
+def _so3_log(R, eps=1e-6):
+    """Rotation matrix -> axis-angle vector (so(3) log), (...,3,3) -> (...,3).
+    Stable for the small residual rotations expected here."""
+    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    ang = torch.arccos(((tr - 1.0)/2.0).clamp(-1.0, 1.0))
+    v = torch.stack([R[..., 2, 1]-R[..., 1, 2], R[..., 0, 2]-R[..., 2, 0], R[..., 1, 0]-R[..., 0, 1]], -1)
+    s = (2.0*torch.sin(ang)).clamp_min(eps)
+    return (v / s.unsqueeze(-1)) * ang.unsqueeze(-1)
+
+
+class CondBodyRegressor(nn.Module):
+    """Deterministic cond -> (reach, unit-direction, rotation) for one body."""
+    def __init__(self, cond_dim, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(cond_dim, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU())
+        self.h_reach = nn.Linear(hidden, 1); self.h_dir = nn.Linear(hidden, 3); self.h_rot = nn.Linear(hidden, 6)
+    def forward(self, cond):
+        h = self.net(cond)
+        return F.softplus(self.h_reach(h)), F.normalize(self.h_dir(h), dim=-1), rot6d_to_matrix(self.h_rot(h))
+
+
+class PoseRegressor(nn.Module):
+    """Per-body deterministic pose predictor cond -> pose (the 'sequence scaffold' of the dock)."""
+    def __init__(self, cond_dim, hidden=64, bodies=BODIES):
+        super().__init__(); self.bodies = bodies
+        self.regs = nn.ModuleDict({b: CondBodyRegressor(cond_dim, hidden) for b in bodies})
+    def forward(self, cond):
+        return [self.regs[b](cond) for b in self.bodies]
+
+
+def _pose_reg_loss(preds, pose, mask):
+    m = mask.bool()
+    if m.sum() == 0: return pose.new_zeros(())
+    loss = pose.new_zeros(())
+    for i, (rh, dh, Rh) in enumerate(preds):
+        seg = pose[:, i*7:(i+1)*7]; t, q = seg[:, 0:3], seg[:, 3:7]
+        reach = torch.linalg.norm(t, dim=-1, keepdim=True); d = t/reach.clamp_min(1e-8)
+        R = quat_to_matrix(canonicalize_quat(q))
+        loss = loss + F.mse_loss(rh[m], reach[m]) + (1-(dh[m]*d[m]).sum(-1)).mean() + geodesic_angle(Rh[m], R[m]).mean()
+    return loss
+
+
+def fit_pose_regressor(cache, hidden=64, epochs=60, lr=1e-3, bs=512, device=None, log=True,
+                       return_history=False, early_stop=True, patience=8, min_delta=1e-4):
+    """PHASE 1: fit cond->pose on a (TRAIN-fold) cache. Geodesic loss, plateau early-stop.
+    Returns the fitted PoseRegressor (+ history)."""
+    import pandas as pd
+    device = device or DEVICE
+    cond = _cond_from_cache(cache); pose = cache["pose"]; mask = cache["pose_mask"]
+    dl = DataLoader(TensorDataset(cond, pose, mask), batch_size=bs, shuffle=True)
+    reg = PoseRegressor(cond.size(1), hidden=hidden).to(device)
+    opt = torch.optim.Adam(reg.parameters(), lr=lr)
+    hist, best, wait, best_state, best_ep = [], float("inf"), 0, None, 0
+    for ep in range(1, epochs+1):
+        reg.train(); tot = n = 0
+        for cb, pb, mb in dl:
+            cb, pb, mb = cb.to(device), pb.to(device), mb.to(device)
+            loss = _pose_reg_loss(reg(cb), pb, mb)
+            opt.zero_grad(); loss.backward(); opt.step()
+            tot += loss.item()*cb.size(0); n += cb.size(0)
+        ep_loss = tot/max(n, 1); hist.append(dict(epoch=ep, loss=ep_loss))
+        if log: print(f"[pose-reg] ep {ep:3d}  geodesic {ep_loss:.4f}")
+        if ep_loss < best - min_delta:
+            best, wait, best_ep = ep_loss, 0, ep
+            best_state = {k: v.detach().cpu().clone() for k, v in reg.state_dict().items()}
+        else:
+            wait += 1
+            if early_stop and wait >= patience:
+                if log: print(f"[pose-reg] early stop ep {ep} (best ep {best_ep}, {best:.4f})")
+                break
+    if best_state is not None: reg.load_state_dict(best_state)
+    return (reg, pd.DataFrame(hist)) if return_history else reg
+
+
+@torch.no_grad()
+def pose_residuals(reg, cache, device=None, standardizer=None):
+    """PHASE 2: per-body residual = [translation residual (3), relative-rotation so(3) log (3)],
+    concatenated over bodies -> (N, 6*n_body). Pose the sequence couldn't predict.
+    Pass a TRAIN `standardizer` (mu, sd) to apply train statistics to a test cache; if None,
+    one is computed from this cache and returned. Returns (residual_np, standardizer)."""
+    device = device or DEVICE; reg.to(device).eval()
+    cond = _cond_from_cache(cache).to(device); pose = cache["pose"].to(device)
+    preds = reg(cond); parts = []
+    for i, (rh, dh, Rh) in enumerate(preds):
+        seg = pose[:, i*7:(i+1)*7]; t, q = seg[:, 0:3], seg[:, 3:7]
+        r_t = t - rh*dh                                       # translation residual (scaled units)
+        R_res = torch.matmul(Rh.transpose(-1, -2), quat_to_matrix(canonicalize_quat(q)))  # R_pred^T R_act
+        parts.append(torch.cat([r_t, _so3_log(R_res)], -1))
+    res = torch.cat(parts, -1).cpu().numpy()
+    if standardizer is None:
+        standardizer = (res.mean(0), res.std(0) + 1e-6)
+    mu, sd = standardizer
+    return (res - mu)/sd, standardizer
+
+
+def residual_orthogonality(residual, cache):
+    """PHASE 3 check: how much of the residual is (linearly) recoverable from cond.
+    Low R^2 ~ residual is sequence-unexplained (residualization worked). Returns a dict."""
+    from sklearn.linear_model import LinearRegression
+    from sklearn.metrics import r2_score
+    cond = _cond_from_cache(cache).cpu().numpy()
+    pred = LinearRegression().fit(cond, residual).predict(cond)
+    return dict(r2_uniform=float(r2_score(residual, pred, multioutput="uniform_average")),
+                r2_variance_weighted=float(r2_score(residual, pred, multioutput="variance_weighted")))
