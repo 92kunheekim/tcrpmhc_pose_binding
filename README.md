@@ -46,7 +46,25 @@ from peptide_specific import run_per_peptide
 from across_peptide import PeptideAwareFusion, CondPeptideAwareFusion, run_mixed, run_lopo
 
 D = load_data("data", min_iptm=0.5)
-warm = make_warm_start(pretrain_tcr_encoders(D["pool"]))
+tcr_enc = pretrain_tcr_encoders(D["pool"])
+warm = make_warm_start(tcr_enc)
 vae6 = pretrain_posevae(D["POSE_ALL"], "6d"); vaeq = pretrain_posevae(D["POSE_ALL"], "qnn")
 resA = run_per_peptide(D["pool"], D["trans_scale"], vae6, vaeq, warm)
+```
+
+### Pretrained + end-to-end conditional pose VAE
+The unconditioned VAE is pretrained then frozen. The conditional VAE
+(`ConditionalPoseVAERaw`, used by `CondPeptideAware(Fusion)`) is trained
+end-to-end by default. To **warm-start it** instead of training from scratch —
+its conditioning depends on the (warm) TCR/peptide encoders, so it is pretrained
+with a fixed encoder bank, then fine-tuned (NOT frozen) so `cond` can drift:
+```python
+from train_utils import pretrain_cond_posevae
+from across_peptide import CondPeptideAwareFusion, run_mixed
+
+cpose, ext = pretrain_cond_posevae(D["pool"], D["trans_scale"], "6d",
+                                   cond_on="vpep", warm_encoders=tcr_enc, return_extras=True)
+warm_c = make_warm_start(tcr_enc, cpose_state=ext["cpose"], pep_state=ext["pep"])
+AFS = {"CondFusion": lambda: warm_c(CondPeptideAwareFusion(cond_on="vpep"))}
+res = run_mixed(D["pool"], D["trans_scale"], AFS, AUXSET={"CondFusion"})  # aux = cvae loss stays on
 ```
