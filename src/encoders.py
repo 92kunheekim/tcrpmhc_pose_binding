@@ -18,3 +18,19 @@ class ChainAutoencoder(nn.Module):
         self.decoder = nn.Sequential(nn.Linear(emb_dim, 128), nn.ReLU(), nn.Linear(128, max_len*5))
     def forward(self, x):
         z = self.encoder(x); return self.decoder(z).view(-1, self.max_len, 5), z
+
+
+class SeqVAE(nn.Module):
+    """Sequence VAE: ChainEncoder -> (mu, logvar) -> z -> reconstruct Atchley matrix.
+    Use `.encoder` (a ChainEncoder) to warm-start a downstream sequence tower
+    (e.g. the peptide encoder)."""
+    def __init__(self, max_len, emb_dim=64, latent=16):
+        super().__init__(); self.max_len = max_len
+        self.encoder = ChainEncoder(emb_dim=emb_dim)
+        self.mu = nn.Linear(emb_dim, latent); self.logvar = nn.Linear(emb_dim, latent)
+        self.decoder = nn.Sequential(nn.Linear(latent, 128), nn.ReLU(), nn.Linear(128, max_len*5))
+    def reparam(self, mu, lv):
+        return mu if not self.training else mu + torch.exp(0.5*lv)*torch.randn_like(lv)
+    def forward(self, x):
+        h = self.encoder(x); mu = self.mu(h); lv = self.logvar(h); z = self.reparam(mu, lv)
+        return self.decoder(z).view(-1, self.max_len, 5), mu, lv, z

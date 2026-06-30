@@ -1,0 +1,10 @@
+IMGT/HLA alignment verification (A/B/C_prot.txt, full reconstruction vs hla_prot.fasta)
+shared alleles checked : 19335
+  exact match          : 19335
+  mismatch             : 0
+
+Dataset alpha1+alpha2 extraction (mature residues 1-182):
+  dataset alleles      : 200
+  HLA matched via align: 151
+  not via alignment    : 49 -> DLA-88*501:01, Mamu-A1*001:01, Mamu-B*017:04, Mamu-A1*011:01, Mamu-A1*002:01, Eqca-1*001:01, Patr-A*09:01, Patr-B*13:01, DLA-88*508:01, BoLA-6*013:01, Eqca-16*001:01, Eqca-1*002:01, Patr-A*01:01, Patr-A*07:01, Gaga-BF2*021:01, Mamu-B*001:01, Patr-B*01:01, BoLA-2*012:01, SLA-1*04:01, Patr-B*24:01, Patr-B*09:01, SLA-3*02:02, Patr-A*06:02, Mamu-B*003:01, Gogo-B*01:01, Gaga-BF2*004:01, BoLA-2*008:01, Gaga-BF2*002:01, SLA-1*07:02, Gaga-BF2*012:01, Gaga-BF2*014:01, Mamu-B*065:02, SLA-2*04:01, Patr-A*03:01, BoLA-2*018:01, SLA-1*03:02, Ptal-N*01:01, Patr-B*17:01, Eqca-N*006:01, BoLA-4*024:01, Patr-A*04:01, SLA-1*15:02, Mamu-B*004:01, Patr-A*06:01, Patr-A*05:01, Gaga-BF1*002:01, BoLA-6*041:01, BoLA-6*013:02, BoLA-1*021:01
+  a1a2 length counts   : {182: 151}

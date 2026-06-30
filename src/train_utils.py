@@ -5,9 +5,9 @@ import torch.nn as nn
 from collections import defaultdict
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, average_precision_score
-from config import CHAINS, CHAIN_MAXLEN, EMB_DIM
+from config import CHAINS, CHAIN_MAXLEN, EMB_DIM, PEP_MAXLEN
 from atchley import encode_sequence, ATCHLEY
-from encoders import ChainAutoencoder, ChainEncoder
+from encoders import ChainAutoencoder, ChainEncoder, SeqVAE
 from pose_vae import PoseVAERaw, vae_raw_loss
 from pose_cvae import ConditionalPoseVAERaw, cvae_loss_masked
 from data import PairData, add_mismatch
@@ -36,7 +36,8 @@ def pretrain_tcr_encoders(seq_df, epochs=15, bs=256, lr=1e-3, seed=42,
     torch.manual_seed(seed); states = {}; hists = {}
     AA = list(ATCHLEY.keys()); AT = torch.tensor([ATCHLEY[a] for a in AA], dtype=torch.float32, device=DEVICE)
     for ch in CHAINS:
-        X = np.stack([encode_sequence(s, CHAIN_MAXLEN[ch]) for s in seq_df[ch]]).astype("float32")
+        vals = [s for s in seq_df[ch] if isinstance(s, str) and s.strip()]   # drop empty/NaN padding
+        X = np.stack([encode_sequence(s, CHAIN_MAXLEN[ch]) for s in vals]).astype("float32")
         Xt = torch.from_numpy(X); loader = DataLoader(TensorDataset(Xt), batch_size=bs, shuffle=True)
         ae = ChainAutoencoder(CHAIN_MAXLEN[ch]).to(DEVICE); opt = torch.optim.Adam(ae.parameters(), lr=lr)
         hist = []; best = float("inf"); wait = 0; best_state = None; best_ep = 0
@@ -65,18 +66,21 @@ def pretrain_tcr_encoders(seq_df, epochs=15, bs=256, lr=1e-3, seed=42,
         hists[ch] = pd.DataFrame(hist)
     return (states, hists) if return_history else states
 
-def make_warm_start(tcr_enc, cpose_state=None, pep_state=None):
+def make_warm_start(tcr_enc, cpose_state=None, pep_state=None, mhc_state=None):
     """Returns a warm_start(model) closure that copies pretrained weights into a
     fresh model. Loads chain encoders (always), and -- when provided -- the
-    peptide encoder and the conditional pose VAE (`cpose`), so a Cond* model can
-    be warm-started end-to-end rather than trained from scratch. All loads are
-    guarded by hasattr, so the same closure works for seq / pose / cond models."""
+    peptide encoder, the MHC encoder, and the conditional pose VAE (`cpose`), so a
+    Cond*/Pan model can be warm-started end-to-end rather than trained from scratch.
+    `pep_state`/`mhc_state` come from pretrain_peptide_masked (pan_specific). All loads
+    are guarded by hasattr, so the same closure works for seq / pose / cond / pan models."""
     def warm_start(model):
         if tcr_enc and hasattr(model, "encoders"):
             for c in model.encoders:
                 if c in tcr_enc: model.encoders[c].load_state_dict(tcr_enc[c])
         if pep_state is not None and hasattr(model, "pep_encoder"):
             model.pep_encoder.load_state_dict(pep_state)
+        if mhc_state is not None and hasattr(model, "mhc_encoder"):
+            model.mhc_encoder.load_state_dict(mhc_state)
         if cpose_state is not None and hasattr(model, "cpose"):
             model.cpose.load_state_dict(cpose_state)
         return model

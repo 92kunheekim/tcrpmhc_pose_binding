@@ -1,0 +1,14 @@
+source,file,rows,new_va,new_vb,new_cdr3a,new_cdr3b
+full_seq_df,full_seq_df_new.csv,825308,157,98,22012,26474
+final_modeled_vj,final_dataset_modeled_vj.csv,46201,410,91,6595,7433
+combined_positives,raw/combined_positives.csv,111091,444,315,19856,50829
+combined_nonbinders,raw/combined_nonbinders.csv,125774,0,0,8,3
+vdjdb_classI,raw/VDJdb_classI_paired_filtered.csv,71991,0,0,0,0
+iedb_positive,raw/IEDB_positive_filtered.csv,8469,0,0,0,0
+10x_cd8_A0201,10x_cd8_A0201_6pep/inputs/combined_sorted.csv,15468,0,0,0,0
+mcpas,raw/McPAS-TCR.csv,40731,0,0,7356,30300
+modeled_vj_cdr3,modeled_vj_cdr3_by_chain.csv,46204,0,0,330,179
+decoys_permuted,raw/decoys_permuted.csv,50000,0,0,599,574
+10x_donors_binders,raw/10X_CD8T_donors/all_donors_binders.csv,29772,0,0,198,277
+10x_donors_nonbinders,raw/10X_CD8T_donors/all_donors_nonbinders.csv,126652,0,0,2,4
+vdjdb_raw,raw/VDJDB.tsv,164724,0,0,1271,1187

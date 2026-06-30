@@ -11,3 +11,8 @@ __pycache__/
 *.pkl
 *.pt
 *.ckpt
+
+# Large pretraining data (raw dumps + bulky IEDB intermediates) — not versioned
+data/pmhc_classI_pretraining/raw/
+data/pmhc_classI_pretraining/processed/iedb_*
+*.zip
