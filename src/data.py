@@ -162,9 +162,12 @@ def add_mismatch(tr, seed=0):
         rows.append(nr)
     return pd.concat([tr, pd.DataFrame(rows)], ignore_index=True) if rows else tr
 
-def repeated_splits(frame, n_repeats=10):
-    """10 independent 80/20 grouped+stratified holdouts (whole V-gene/CDR3 clusters held out)."""
-    g = cluster_tcrs(frame); y = frame.label.to_numpy().astype(int); out = []
+def repeated_splits(frame, n_repeats=10, groups=None):
+    """10 independent 80/20 grouped+stratified holdouts (whole TCR clusters held out).
+    groups: optional precomputed cluster labels (e.g. from cluster_tcrs_tcrdist); defaults
+    to the sequence-identity cluster_tcrs."""
+    g = cluster_tcrs(frame) if groups is None else np.asarray(groups)
+    y = frame.label.to_numpy().astype(int); out = []
     for r in range(n_repeats):
         tr, te = next(iter(StratifiedGroupKFold(5, shuffle=True, random_state=100+r).split(np.zeros(len(y)), y, g)))
         out.append((tr, te))
