@@ -10,7 +10,7 @@ from atchley import encode_sequence, ATCHLEY
 from encoders import ChainAutoencoder, ChainEncoder, SeqVAE
 from pose_vae import PoseVAERaw, vae_raw_loss
 from pose_cvae import ConditionalPoseVAERaw, cvae_loss_masked
-from data import PairData, add_mismatch
+from data import PairData, add_mismatch, split_chain
 from geometry import quat_to_matrix, canonicalize_quat, geodesic_angle
 import torch.nn.functional as F
 import math, pandas as pd
@@ -85,6 +85,63 @@ def make_warm_start(tcr_enc, cpose_state=None, pep_state=None, mhc_state=None):
             model.cpose.load_state_dict(cpose_state)
         return model
     return warm_start
+
+# ---- leakage-control clustering in the (frozen) TCR-encoder latent space ----
+def _ensure_chain_cols(frame):
+    """Return a frame guaranteed to have va/vb/cdr3a/cdr3b (derive from tcra/tcrb if missing)."""
+    if all(c in frame.columns for c in CHAINS):
+        return frame
+    f = frame.copy()
+    f["cdr3a"], f["va"] = zip(*f.tcra_seq.map(split_chain))
+    f["cdr3b"], f["vb"] = zip(*f.tcrb_seq.map(split_chain))
+    return f
+
+@torch.no_grad()
+def embed_tcrs(tcr_enc, frame, bs=512, device=None):
+    """Concatenated frozen per-chain embeddings per TCR -> (N, 4*EMB_DIM).
+    tcr_enc: {chain: state_dict} from pretrain_tcr_encoders (LABEL-AGNOSTIC, frozen).
+    frame needs va/vb/cdr3a/cdr3b (derived from tcra_seq/tcrb_seq if absent)."""
+    device = device or DEVICE; frame = _ensure_chain_cols(frame)
+    encs = {}
+    for ch in CHAINS:
+        e = ChainEncoder(emb_dim=EMB_DIM).to(device).eval()
+        if tcr_enc and ch in tcr_enc: e.load_state_dict(tcr_enc[ch])
+        encs[ch] = e
+    parts = []
+    for ch in CHAINS:
+        X = np.stack([encode_sequence(s, CHAIN_MAXLEN[ch]) for s in frame[ch]]).astype("float32")
+        out = [encs[ch](torch.from_numpy(X[i:i+bs]).to(device)).cpu().numpy() for i in range(0, len(X), bs)]
+        parts.append(np.concatenate(out) if out else np.zeros((0, EMB_DIM), "float32"))
+    return np.concatenate(parts, axis=1)
+
+def cluster_tcrs_embedding(tcr_enc, frame, threshold=0.15, metric="cosine", bs=512, device=None):
+    """Leakage-control clusters from FROZEN pretrained TCR-encoder embeddings: single-linkage
+    (connected components) on a distance-threshold graph over the concatenated per-chain
+    embeddings. USE ONLY the label-agnostic pretrained encoder (never a task-trained one) or
+    the CV becomes circular. `threshold` = max linking distance (cosine distance for metric
+    'cosine'; calibrate so granularity ~matches cluster_tcrs). Returns integer labels per row.
+    Memory-light: uses a radius graph (edges only), so it scales past full N*N matrices."""
+    from sklearn.neighbors import radius_neighbors_graph
+    from scipy.sparse.csgraph import connected_components
+    Z = embed_tcrs(tcr_enc, frame, bs=bs, device=device); n = len(Z)
+    if n <= 1: return np.zeros(n, dtype=int)
+    G = radius_neighbors_graph(Z, radius=threshold, mode="connectivity", metric=metric, include_self=False)
+    return connected_components(G, directed=False)[1]
+
+def cluster_threshold_scan(tcr_enc, frame, thresholds=(0.05, 0.1, 0.15, 0.2, 0.3),
+                           metric="cosine", bs=512, device=None):
+    """Helper: #clusters (and largest cluster size) vs threshold, to calibrate against the
+    sequence-based cluster_tcrs granularity. Returns a DataFrame."""
+    Z = embed_tcrs(tcr_enc, frame, bs=bs, device=device); n = len(Z)
+    from sklearn.neighbors import radius_neighbors_graph
+    from scipy.sparse.csgraph import connected_components
+    rows = []
+    for t in thresholds:
+        G = radius_neighbors_graph(Z, radius=t, mode="connectivity", metric=metric, include_self=False)
+        lab = connected_components(G, directed=False)[1]
+        _, cnt = np.unique(lab, return_counts=True)
+        rows.append(dict(threshold=t, n_clusters=len(cnt), largest=int(cnt.max()), singletons=int((cnt == 1).sum())))
+    return pd.DataFrame(rows)
 
 def _pose_components(recon, x, mu, logvar):
     """Returns (rec_loss, kld, metrics) — rec matches vae_raw_loss; metrics in

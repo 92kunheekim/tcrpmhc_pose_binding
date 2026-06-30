@@ -41,6 +41,57 @@ def cluster_tcrs(sub, ident=0.8):
                 if idn(cb[i], cb[j]) >= ident and idn(ca[i], ca[j]) >= ident: par[find(j)] = find(i)
     return np.unique([find(i) for i in range(n)], return_inverse=True)[1]
 
+def _lev(a, b):
+    """Levenshtein edit distance (small strings, pure-python DP)."""
+    if a == b: return 0
+    la, lb = len(a), len(b)
+    if la == 0: return lb
+    if lb == 0: return la
+    prev = list(range(lb+1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0]*lb
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+(ca != cb))
+        prev = cur
+    return prev[lb]
+
+def _lev_sim(a, b):
+    """Normalized Levenshtein similarity in [0,1]: 1 - edit/max(len). 0 if either empty."""
+    if not a or not b: return 0.0
+    m = max(len(a), len(b))
+    return 1.0 - _lev(a, b)/m
+
+def cluster_tcrs_tcrdist(sub, ident=0.8, block_v=True):
+    """Leakage-control clusters using CDR3 **edit distance** (normalized Levenshtein) instead
+    of positional identity — handles indels / unequal CDR3 lengths (the gap in cluster_tcrs).
+    Single-linkage: same V-region on both chains (when block_v) + Levenshtein similarity >= ident
+    on BOTH CDR3 chains. block_v=True restricts comparisons to identical V-region prefixes for
+    speed (drops the per-chain length constraint so indel variants in the same V can merge).
+    Returns integer cluster labels per row (same format as cluster_tcrs)."""
+    n = len(sub); ca, va, cb, vb = [], [], [], []
+    for s in sub.tcra_seq:
+        c, v = split_chain(s); ca.append(c); va.append(v)
+    for s in sub.tcrb_seq:
+        c, v = split_chain(s); cb.append(c); vb.append(v)
+    par = list(range(n))
+    def find(x):
+        while par[x] != x: par[x] = par[par[x]]; x = par[x]
+        return x
+    gap = 1.0 - ident                                   # max allowed length-fraction gap
+    def len_ok(x, y):
+        m = max(len(x), len(y), 1); return abs(len(x)-len(y))/m <= gap
+    bl = defaultdict(list)
+    for i in range(n): bl[(va[i], vb[i]) if block_v else 0].append(i)
+    for mem in bl.values():
+        for a in range(len(mem)):
+            for b in range(a+1, len(mem)):
+                i, j = mem[a], mem[b]
+                if not (ca[i] and ca[j] and cb[i] and cb[j]): continue            # need both CDR3s
+                if not (len_ok(cb[i], cb[j]) and len_ok(ca[i], ca[j])): continue  # prefilter
+                if _lev_sim(cb[i], cb[j]) >= ident and _lev_sim(ca[i], ca[j]) >= ident:
+                    par[find(j)] = find(i)
+    return np.unique([find(i) for i in range(n)], return_inverse=True)[1]
+
 def load_data(data_dir, min_iptm=0.5):
     """Returns dict with pool df (ipTM filtered, posed), trans_scale, and POSE_ALL pretrain corpus."""
     seq = pd.read_csv(f"{data_dir}/combined_sorted.csv")
