@@ -560,13 +560,15 @@ def _cached_loader(cache, fields, bs, shuffle):
 
 
 def train_cached(model, cache, epochs=15, lr=1e-3, pw=1.0, aux=True, lam_pose=0.3,
-                 beta=0.1, bs=512, weight_decay=1e-4, shuffle=True):
+                 beta=0.1, bs=512, weight_decay=1e-4, shuffle=True, extra_freeze=()):
     """Joint classification (+ optional aux VAE) on cached frozen-tower features.
     Trains only tcr_proj + cpose + head (+ null_pose); encoders/pep/mhc stay frozen.
     Much cheaper than train_panfusion(freeze=TOWER_PREFIXES) because sequences are never
-    re-encoded. Respects model.head_feats. Build `cache` with cache_tower_features."""
+    re-encoded. Respects model.head_feats. Build `cache` with cache_tower_features.
+    extra_freeze: additional module prefixes to freeze, e.g. ('cpose','tcr_proj') for a
+    pure head probe of a pretrained pose latent."""
     model.to(DEVICE)
-    _apply_freeze(model, TOWER_PREFIXES)
+    _apply_freeze(model, tuple(TOWER_PREFIXES) + tuple(extra_freeze))
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad],
                            lr=lr, weight_decay=weight_decay)
     crit = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], device=DEVICE))
@@ -630,3 +632,85 @@ def pretrain_cond_pose_vae_cached(model, cache, epochs=40, lr=1e-3, beta=0.1, bs
         model.cpose.load_state_dict(best_state)
     state = {k: v.detach().cpu().clone() for k, v in model.cpose.state_dict().items()}
     return (state, pd.DataFrame(hist)) if return_history else state
+
+
+@torch.no_grad()
+def predict_cached(model, cache, bs=1024):
+    """Sigmoid predictions from cached frozen-tower features (mirrors train_cached's forward).
+    Returns (probs, y)."""
+    model.to(DEVICE).eval()
+    chains = list(model.chains); fields = chains + ["p", "h", "pose", "pose_mask", "y"]
+    dl = _cached_loader(cache, fields, bs, shuffle=False)
+    ps, ys = [], []
+    for batch in dl:
+        v = {k: t.to(DEVICE) for k, t in zip(fields, batch)}
+        enc = {c: v[c] for c in chains}
+        t = model.tcr_proj(torch.cat([enc[c] for c in chains], 1))
+        p, h, pose, mask = v["p"], v["h"], v["pose"], v["pose_mask"]
+        pose_mu = None
+        if model.use_pose:
+            _, mu, _, _ = model.cpose(pose, torch.cat([enc["va"], enc["vb"], p, h], 1))
+            mk = mask.float().unsqueeze(1); pose_mu = mk*mu + (1-mk)*model.null_pose.unsqueeze(0)
+        fmap = {"t": t, "p": p, "h": h, "tp": t*p, "th": t*h, "pose": pose_mu}
+        logit = model.head(torch.cat([fmap[f] for f in model.head_feats], 1)).squeeze(-1)
+        ps.append(torch.sigmoid(logit).cpu().numpy()); ys.append(v["y"].cpu().numpy())
+    return np.concatenate(ps), np.concatenate(ys)
+
+
+def run_cpose_ablation(frame, trans_scale, esm_table, splits, warm,
+                       head_feats="pose_tp", pep_arch="transformer", rotation_encoder="6d",
+                       epochs=15, pre_epochs=30, lr=1e-3, lam_pose=0.3, beta=0.1, bs=512,
+                       mhc_col="mhc_seq", conditions=("A", "B", "C", "D"), log=True):
+    """Conditional-pose-VAE pretraining ablation (A/B/C/D) on a fixed-antigen / single-allele
+    set, using cached frozen towers (towers warm-started once per split; only the pose tower
+    + head differ across conditions).
+
+      A : cpose trained by classification only (no aux VAE loss)         [floor]
+      B : cpose trained JOINTLY with aux VAE loss, no pretrain           [baseline to beat]
+      C : Scheme-1 pretrain cpose -> finetune with aux                   [candidate]
+      D : Scheme-1 pretrain cpose -> freeze cpose+tcr_proj, train head   [probe: is the
+          pretrained pose latent discriminative on its own?]
+
+    `splits` = list of (train_idx, test_idx) into `frame` (e.g. LOPO or TCR-cluster).
+    `warm` = make_warm_start(...) closure (TCR/peptide/MHC warm-start applied to every model).
+
+    Returns (metrics_df, oof) where metrics_df has per-(condition,split) AUROC/AUPRC and oof
+    maps condition -> dict(idx, y, p) concatenated across splits (for cluster bootstrap)."""
+    import pandas as pd
+    from sklearn.metrics import roc_auc_score, average_precision_score
+
+    def fresh():
+        return warm(PanFusion(use_pose=True, pep_arch=pep_arch, rotation_encoder=rotation_encoder,
+                              head_feats=head_feats))
+
+    rows = []; oof = {c: {"idx": [], "y": [], "p": []} for c in conditions}
+    for si, (tr, te) in enumerate(splits):
+        trf = frame.iloc[tr].reset_index(drop=True); tef = frame.iloc[te].reset_index(drop=True)
+        yt = trf.label.to_numpy().astype(int); pw = (yt == 0).sum()/max((yt == 1).sum(), 1)
+        # cache the (warm, frozen) towers once for this split; reused across conditions
+        base = fresh()
+        ctr = cache_tower_features(base, pan_loader(trf, trans_scale, esm_table, bs=bs, shuffle=False, mhc_col=mhc_col))
+        cte = cache_tower_features(base, pan_loader(tef, trans_scale, esm_table, bs=bs, shuffle=False, mhc_col=mhc_col))
+        for cond in conditions:
+            m = fresh()
+            if cond == "A":
+                train_cached(m, ctr, epochs=epochs, lr=lr, pw=pw, aux=False, bs=bs)
+            elif cond == "B":
+                train_cached(m, ctr, epochs=epochs, lr=lr, pw=pw, aux=True, lam_pose=lam_pose, beta=beta, bs=bs)
+            elif cond == "C":
+                pretrain_cond_pose_vae_cached(m, ctr, epochs=pre_epochs, lr=lr, beta=beta, bs=bs, log=False)
+                train_cached(m, ctr, epochs=epochs, lr=lr, pw=pw, aux=True, lam_pose=lam_pose, beta=beta, bs=bs)
+            elif cond == "D":
+                pretrain_cond_pose_vae_cached(m, ctr, epochs=pre_epochs, lr=lr, beta=beta, bs=bs, log=False)
+                train_cached(m, ctr, epochs=epochs, lr=lr, pw=pw, aux=False, bs=bs,
+                             extra_freeze=("cpose", "tcr_proj"))
+            p, y = predict_cached(m, cte)
+            oof[cond]["idx"].append(np.asarray(te)); oof[cond]["y"].append(y); oof[cond]["p"].append(p)
+            au = roc_auc_score(y, p) if len(np.unique(y)) > 1 else float("nan")
+            ap = average_precision_score(y, p) if len(np.unique(y)) > 1 else float("nan")
+            rows.append(dict(condition=cond, split=si, auroc=au, auprc=ap,
+                             n=len(y), prevalence=float(y.mean())))
+            if log: print(f"  split {si} [{cond}] AUROC={au:.3f} AUPRC={ap:.3f} (n={len(y)}, prev={y.mean():.3f})")
+    for c in conditions:
+        oof[c] = {k: np.concatenate(v) for k, v in oof[c].items()}
+    return pd.DataFrame(rows), oof
