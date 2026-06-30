@@ -6,7 +6,7 @@ from collections import defaultdict
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, average_precision_score
 from config import CHAINS, CHAIN_MAXLEN, EMB_DIM
-from atchley import encode_sequence
+from atchley import encode_sequence, ATCHLEY
 from encoders import ChainAutoencoder, ChainEncoder
 from pose_vae import PoseVAERaw, vae_raw_loss
 from pose_cvae import ConditionalPoseVAERaw, cvae_loss_masked
@@ -19,17 +19,51 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 RAD2DEG = 180.0/math.pi
 
 # ---- pretraining ----
-def pretrain_tcr_encoders(seq_df, epochs=12, bs=256, lr=1e-3, seed=42):
-    torch.manual_seed(seed); states = {}
+def _aa_recon_accuracy(rec, x, AT):
+    """Decode reconstructed Atchley rows to nearest amino acid and compare to the
+    true residues, ignoring zero-padded positions. rec,x:(B,L,5); AT:(20,5)."""
+    pad = (x.abs().sum(-1) < 1e-6).reshape(-1)               # padding positions
+    dt = torch.cdist(x.reshape(-1, 5), AT); dp = torch.cdist(rec.reshape(-1, 5), AT)
+    valid = ~pad
+    if valid.sum() == 0: return float("nan")
+    return float((dp.argmin(-1)[valid] == dt.argmin(-1)[valid]).float().mean())
+
+def pretrain_tcr_encoders(seq_df, epochs=15, bs=256, lr=1e-3, seed=42,
+                          return_history=False, log=True, early_stop=True, patience=5, min_delta=1e-4):
+    """Per-chain Atchley autoencoder warm-start with tracking + plateau early stop.
+    Tracks reconstruction MSE, amino-acid reconstruction accuracy (interpretable),
+    and active embedding dims. With return_history=True also returns {chain: DataFrame}."""
+    torch.manual_seed(seed); states = {}; hists = {}
+    AA = list(ATCHLEY.keys()); AT = torch.tensor([ATCHLEY[a] for a in AA], dtype=torch.float32, device=DEVICE)
     for ch in CHAINS:
         X = np.stack([encode_sequence(s, CHAIN_MAXLEN[ch]) for s in seq_df[ch]]).astype("float32")
-        loader = DataLoader(TensorDataset(torch.from_numpy(X)), batch_size=bs, shuffle=True)
-        ae = ChainAutoencoder(CHAIN_MAXLEN[ch]).to(DEVICE); opt = torch.optim.Adam(ae.parameters(), lr=lr); ae.train()
-        for _ in range(epochs):
+        Xt = torch.from_numpy(X); loader = DataLoader(TensorDataset(Xt), batch_size=bs, shuffle=True)
+        ae = ChainAutoencoder(CHAIN_MAXLEN[ch]).to(DEVICE); opt = torch.optim.Adam(ae.parameters(), lr=lr)
+        hist = []; best = float("inf"); wait = 0; best_state = None; best_ep = 0
+        for ep in range(1, epochs+1):
+            ae.train(); tot = 0.0; ntot = 0
             for (xb,) in loader:
-                xb = xb.to(DEVICE); rec, _ = ae(xb); loss = F.mse_loss(rec, xb); opt.zero_grad(); loss.backward(); opt.step()
-        states[ch] = {k: v.cpu() for k, v in ae.encoder.state_dict().items()}
-    return states
+                xb = xb.to(DEVICE); rec, _ = ae(xb); loss = F.mse_loss(rec, xb)
+                opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()*xb.size(0); ntot += xb.size(0)
+            mse = tot/ntot
+            ae.eval()
+            with torch.no_grad():
+                xb = Xt[:1024].to(DEVICE); rec, z = ae(xb)
+                acc = _aa_recon_accuracy(rec, xb, AT); active = int((z.var(0) > 0.01).sum().item())
+            hist.append({"chain": ch, "epoch": ep, "mse": mse, "aa_acc": acc, "active_emb": active, "emb_dim": int(z.size(1))})
+            if log and (ep % 5 == 0 or ep == 1):
+                print(f"  [{ch:5s}] ep{ep:3d} mse={mse:.4f} aa_acc={acc:.3f} active={active}/{z.size(1)}")
+            if mse < best - min_delta:
+                best = mse; wait = 0; best_ep = ep
+                best_state = {k: v.detach().cpu().clone() for k, v in ae.encoder.state_dict().items()}
+            elif early_stop:
+                wait += 1
+                if wait >= patience:
+                    if log: print(f"  [{ch}] early stop epoch {ep} (best {best_ep}, mse {best:.4f})")
+                    break
+        states[ch] = best_state if best_state is not None else {k: v.detach().cpu().clone() for k, v in ae.encoder.state_dict().items()}
+        hists[ch] = pd.DataFrame(hist)
+    return (states, hists) if return_history else states
 
 def make_warm_start(tcr_enc, cpose_state=None, pep_state=None):
     """Returns a warm_start(model) closure that copies pretrained weights into a
