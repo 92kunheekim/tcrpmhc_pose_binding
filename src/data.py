@@ -61,6 +61,25 @@ def _scale_pose(A, trans_scale):
     for b in range(len(BODIES)): A[:, b*7:b*7+3] /= trans_scale
     return A
 
+def pose_corpus(data_dir, which="all", min_iptm=None):
+    """Unsupervised pose-VAE pretraining corpus (scaled).
+    which: 'all' (binder+nonbinder), 'binder', or 'nonbinder'.
+    min_iptm: optional ipTM threshold to filter the corpus.
+    trans_scale is computed from ALL structures (consistent with training)."""
+    desc = pd.read_csv(f"{data_dir}/pose_descriptors.csv").dropna(subset=RAW)
+    allraw = desc[RAW].to_numpy("float32")
+    trans_scale = float(np.mean(np.concatenate(
+        [np.linalg.norm(allraw[:, b*7:b*7+3], axis=1) for b in range(len(BODIES))])))
+    sel = desc
+    if min_iptm is not None:
+        ip = pd.read_csv(f"{data_dir}/iptm_table.csv")
+        sel = sel.merge(ip, on="id"); sel = sel[sel.tcr_pmhc_iptm >= min_iptm]
+    if which == "binder":
+        sel = sel[sel.label == 1]
+    elif which == "nonbinder":
+        sel = sel[sel.label == 0]
+    return _scale_pose(sel[RAW].to_numpy("float32"), trans_scale), trans_scale
+
 def build_pose(frame, trans_scale):
     return _scale_pose(frame[RAW].to_numpy("float32"), trans_scale)
 
