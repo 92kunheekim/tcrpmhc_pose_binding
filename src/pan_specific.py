@@ -20,6 +20,7 @@ makes the architecture ready.
 
 Evaluation for a pan model: leave-one-allele-out (LOAO) + leave-one-peptide-out.
 """
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -834,3 +835,140 @@ def residual_orthogonality(residual, cache):
     pred = LinearRegression().fit(cond, residual).predict(cond)
     return dict(r2_uniform=float(r2_score(residual, pred, multioutput="uniform_average")),
                 r2_variance_weighted=float(r2_score(residual, pred, multioutput="variance_weighted")))
+
+
+# ----------------------------------------------------------------------------
+# Conditional normalizing flow for V-marginalized CDR3 pose residual.
+# Models p(pose | V) in FramePose TANGENT space (translation in R^3 + so(3) log at
+# the per-body Frechet-mean rotation) via a conditional RealNVP, conditioned on [va,vb].
+# The base-space code z = flow(pose; V) is the DISTRIBUTIONAL residual (V removed in
+# mean AND higher moments, if the flow fits well); log p(pose|V) is a dock-atypicality
+# feature. Verify independence with HSIC, not just linear R^2. Fit on TRAIN folds only.
+# ----------------------------------------------------------------------------
+BODY_IDX = {b: i for i, b in enumerate(BODIES)}
+
+
+def _quat_mean_R(q):
+    """Quaternion (chordal/eigen) average of (N,4) -> mean rotation matrix (3,3)."""
+    qn = canonicalize_quat(q); qn = qn/qn.norm(dim=1, keepdim=True)
+    M = (qn.unsqueeze(-1)*qn.unsqueeze(-2)).mean(0)          # (4,4)
+    _, V = torch.linalg.eigh(M); m = V[:, -1]
+    if m[0] < 0: m = -m
+    return quat_to_matrix(m.unsqueeze(0)).squeeze(0)
+
+
+def _bodies_tangent(pose, body_idx, rot_refs=None):
+    """Per body -> [translation (3, scaled), so(3) log at Frechet-mean rotation (3)];
+    concatenated over bodies -> (N, 6*n_body). Returns (feats, rot_refs)."""
+    outs, refs = [], []
+    for k, bi in enumerate(body_idx):
+        seg = pose[:, bi*7:(bi+1)*7]; t = seg[:, 0:3]; R = quat_to_matrix(canonicalize_quat(seg[:, 3:7]))
+        Rref = _quat_mean_R(seg[:, 3:7]) if rot_refs is None else rot_refs[k]
+        rl = _so3_log(torch.matmul(Rref.t().unsqueeze(0), R))
+        outs.append(torch.cat([t, rl], -1)); refs.append(Rref)
+    return torch.cat(outs, -1), (refs if rot_refs is None else rot_refs)
+
+
+class CondAffineCoupling(nn.Module):
+    """RealNVP affine coupling; scale/shift of the unmasked coords conditioned on the
+    masked coords + external conditioning `cond`."""
+    def __init__(self, dim, cond_dim, hidden, mask):
+        super().__init__(); self.register_buffer("mask", mask.float())
+        self.net = nn.Sequential(nn.Linear(dim+cond_dim, hidden), nn.ReLU(),
+                                 nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 2*dim))
+    def _st(self, x, cond):
+        h = self.net(torch.cat([x*self.mask, cond], -1)); s, t = h.chunk(2, -1)
+        return torch.tanh(s)*(1-self.mask), t*(1-self.mask)
+    def forward(self, x, cond):
+        s, t = self._st(x, cond)
+        return x*self.mask + (1-self.mask)*(x*torch.exp(s) + t), s.sum(-1)
+    def inverse(self, y, cond):
+        s, t = self._st(y, cond)                                # masked coords of y == those of x
+        return y*self.mask + (1-self.mask)*((y - t)*torch.exp(-s))
+
+
+class CondRealNVP(nn.Module):
+    def __init__(self, dim, cond_dim, n_layers=8, hidden=128):
+        super().__init__(); self.dim = dim
+        base = (torch.arange(dim) % 2)
+        self.layers = nn.ModuleList([CondAffineCoupling(dim, cond_dim, hidden,
+                                     base if i % 2 == 0 else 1-base) for i in range(n_layers)])
+    def forward(self, x, cond):
+        ld = x.new_zeros(x.size(0))
+        for l in self.layers: x, d = l(x, cond); ld = ld + d
+        return x, ld
+    def inverse(self, z, cond):
+        for l in reversed(self.layers): z = l.inverse(z, cond)
+        return z
+    def log_prob(self, x, cond):
+        z, ld = self.forward(x, cond)
+        return -0.5*(z**2).sum(-1) - 0.5*self.dim*math.log(2*math.pi) + ld
+
+
+def fit_cond_flow(cache, body_names=("cdr3a", "cdr3b"), cond_keys=("va", "vb"),
+                  n_layers=8, hidden=128, epochs=200, lr=1e-3, bs=512, val_frac=0.15,
+                  weight_decay=1e-5, device=None, log=True, patience=15, min_delta=1e-3, seed=0):
+    """Fit p(pose|V) as a conditional RealNVP in tangent space (TRAIN fold only).
+    Max-likelihood with a held-out validation split + early stop. Returns a fit dict
+    (flow, rot_refs, standardizer, body_idx, cond_keys) for flow_residual."""
+    device = device or DEVICE; torch.manual_seed(seed)
+    body_idx = [BODY_IDX[b] for b in body_names]
+    feats, rot_refs = _bodies_tangent(cache["pose"], body_idx, None)
+    mu, sd = feats.mean(0), feats.std(0) + 1e-6
+    X = (feats - mu)/sd
+    cond = torch.cat([cache[k] for k in cond_keys], 1)
+    n = X.size(0); perm = torch.randperm(n); nv = max(int(n*val_frac), 1)
+    vi, ti = perm[:nv], perm[nv:]
+    flow = CondRealNVP(X.size(1), cond.size(1), n_layers, hidden).to(device)
+    opt = torch.optim.Adam(flow.parameters(), lr=lr, weight_decay=weight_decay)
+    Xt, Ct = X[ti].to(device), cond[ti].to(device); Xv, Cv = X[vi].to(device), cond[vi].to(device)
+    dl = DataLoader(TensorDataset(Xt, Ct), batch_size=bs, shuffle=True)
+    best, wait, best_state = float("inf"), 0, None
+    for ep in range(1, epochs+1):
+        flow.train()
+        for xb, cb in dl:
+            loss = -flow.log_prob(xb, cb).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+        flow.eval()
+        with torch.no_grad():
+            vloss = float(-flow.log_prob(Xv, Cv).mean())
+        if log and (ep % 20 == 0 or ep == 1): print(f"[cond-flow] ep {ep:3d}  val NLL {vloss:.3f}")
+        if vloss < best - min_delta:
+            best, wait = vloss, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in flow.state_dict().items()}
+        else:
+            wait += 1
+            if wait >= patience:
+                if log: print(f"[cond-flow] early stop ep {ep} (val NLL {best:.3f})"); break
+    if best_state is not None: flow.load_state_dict(best_state)
+    return dict(flow=flow, rot_refs=rot_refs, mu=mu, sd=sd, body_idx=body_idx, cond_keys=list(cond_keys))
+
+
+@torch.no_grad()
+def flow_residual(fit, cache, device=None):
+    """Base-space residual z = flow(pose;V) (V-marginalized pose code) and the
+    dock-atypicality log p(pose|V). Returns (z_np (N,d), logprob_np (N,))."""
+    device = device or DEVICE
+    feats, _ = _bodies_tangent(cache["pose"], fit["body_idx"], fit["rot_refs"])
+    X = ((feats - fit["mu"])/fit["sd"]).to(device)
+    cond = torch.cat([cache[k] for k in fit["cond_keys"]], 1).to(device)
+    z, ld = fit["flow"](X, cond)
+    logp = -0.5*(z**2).sum(-1) - 0.5*z.size(1)*math.log(2*math.pi) + ld
+    return z.cpu().numpy(), logp.cpu().numpy()
+
+
+def hsic_rbf(X, Y, n=1500, seed=0):
+    """Biased HSIC with RBF kernels (median-heuristic bandwidth), subsampled. Lower =
+    more independent. Use to check residual z vs cond captures nonlinear dependence a
+    linear R^2 would miss."""
+    rng = np.random.default_rng(seed); X = np.asarray(X, float); Y = np.asarray(Y, float)
+    if X.ndim == 1: X = X[:, None]
+    if Y.ndim == 1: Y = Y[:, None]
+    if len(X) > n:
+        idx = rng.choice(len(X), n, replace=False); X, Y = X[idx], Y[idx]
+    def K(A):
+        d = ((A[:, None, :] - A[None, :, :])**2).sum(-1); med = np.median(d[d > 0]) + 1e-12
+        return np.exp(-d/med)
+    m = len(X); H = np.eye(m) - 1.0/m
+    Kx, Ky = H @ K(X) @ H, H @ K(Y) @ H
+    return float((Kx*Ky).sum()/(m-1)**2)
