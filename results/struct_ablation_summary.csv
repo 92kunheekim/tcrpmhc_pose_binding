@@ -1,8 +1,8 @@
 ,auroc,auroc,auprc,auprc
 ,mean,std,mean,std
 config,,,,
-full,0.936,0.011,0.879,0.022
-full_permz,0.941,0.01,0.897,0.018
-seq,0.937,0.012,0.895,0.022
-seq_pepstruct,0.938,0.011,0.892,0.025
-seq_pepstruct_z,0.932,0.011,0.871,0.02
+full,0.936,0.011,0.882,0.021
+full_permz,0.942,0.01,0.898,0.019
+seq,0.938,0.013,0.892,0.03
+seq_pepstruct,0.937,0.01,0.892,0.02
+seq_pepstruct_z,0.935,0.011,0.878,0.021
